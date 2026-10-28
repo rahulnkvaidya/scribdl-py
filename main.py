@@ -15,8 +15,11 @@ import configparser
 import json
 import tempfile
 import atexit
+import threading
 from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+batch_file_lock = threading.Lock()
 
 def load_config():
     config = configparser.ConfigParser()
@@ -138,6 +141,64 @@ def log_history(url, title, pages_count, output_file):
     
     with open(history_file, 'w') as f:
         json.dump(history, f, indent=4)
+
+def is_already_downloaded(url):
+    match = re.search(r"/(?:document|presentation|doc|book|article|listen)/(\d+)", url)
+    doc_id = match.group(1) if match else url
+    
+    history_file = "history.json"
+    if os.path.exists(history_file):
+        try:
+            with open(history_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+                for entry in history:
+                    h_url = entry.get("url", "")
+                    h_match = re.search(r"/(?:document|presentation|doc|book|article|listen)/(\d+)", h_url)
+                    h_id = h_match.group(1) if h_match else h_url
+                    if h_id == doc_id:
+                        out_path = entry.get("output", "")
+                        if out_path and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                            return True
+                        base_name = os.path.basename(out_path) if out_path else ""
+                        if base_name:
+                            for check_dir in ["output", "output/done"]:
+                                p = os.path.join(check_dir, base_name)
+                                if os.path.exists(p) and os.path.getsize(p) > 0:
+                                    return True
+        except Exception:
+            pass
+            
+    return False
+
+def remove_url_from_file(file_path, target_url):
+    if not file_path or not os.path.exists(file_path):
+        return
+    with batch_file_lock:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            clean_target = target_url.strip().strip("'\"")
+            target_match = re.search(r"/(?:document|presentation|doc|book|article|listen)/(\d+)", clean_target)
+            target_id = target_match.group(1) if target_match else clean_target
+            
+            new_lines = []
+            for line in lines:
+                stripped = line.strip().strip("'\"")
+                if not stripped or stripped.startswith('#'):
+                    new_lines.append(line)
+                    continue
+                line_match = re.search(r"/(?:document|presentation|doc|book|article|listen)/(\d+)", stripped)
+                line_id = line_match.group(1) if line_match else stripped
+                
+                if line_id == target_id:
+                    continue
+                new_lines.append(line)
+                
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+        except Exception:
+            pass
 
 def is_scribd_search_url(url):
     return bool(re.search(r"scribd\.com/search\b", url, re.I))
@@ -541,9 +602,28 @@ def main(url, file, threads, output, pages, delay, scale, search_pages, save_url
         print("Error: Target URL or input file (-f/--file) is required.")
         sys.exit(1)
 
+    is_batch_mode = len(urls_to_process) > 1 or file is not None
+
+    if file and is_batch_mode:
+        pending_urls = []
+        already_count = 0
+        for u in urls_to_process:
+            if is_already_downloaded(u):
+                already_count += 1
+                remove_url_from_file(file, u)
+            else:
+                pending_urls.append(u)
+        if already_count > 0 and not quiet:
+            print(f"[i] Skipped and removed {already_count} already-downloaded URL(s) from '{file}'.")
+        urls_to_process = pending_urls
+
+    if not urls_to_process:
+        if not quiet:
+            print(f"[✓] All URLs in '{file}' have already been downloaded!")
+        sys.exit(0)
+
     successful = 0
     total = len(urls_to_process)
-    is_batch_mode = len(urls_to_process) > 1 or file is not None
 
     if is_batch_mode and len(urls_to_process) > 1:
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -557,9 +637,12 @@ def main(url, file, threads, output, pages, delay, scale, search_pages, save_url
                 for item_url in urls_to_process
             }
             for future in as_completed(future_to_url):
+                u = future_to_url[future]
                 try:
                     if future.result():
                         successful += 1
+                        if file:
+                            remove_url_from_file(file, u)
                 except Exception as e:
                     print(f"Error processing URL: {e}")
     else:
@@ -568,6 +651,8 @@ def main(url, file, threads, output, pages, delay, scale, search_pages, save_url
                 print(f"\nBatch Task [{idx}/{total}]")
             if process_download(item_url, output if len(urls_to_process) == 1 else None, pages, delay, scale, quiet, is_batch=is_batch_mode, threads=final_threads, browser_path=browser_path):
                 successful += 1
+                if file:
+                    remove_url_from_file(file, item_url)
 
     if is_batch_mode and not quiet:
         print(f"\n[✓] Batch complete: {successful}/{total} documents downloaded successfully.")
