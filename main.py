@@ -1,5 +1,12 @@
 import os
 import sys
+
+# Auto-switch to local virtual environment if running with system python
+if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
+    venv_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "venv", "bin", "python3")
+    if os.path.exists(venv_py) and os.path.abspath(sys.executable) != os.path.abspath(venv_py):
+        os.execv(venv_py, [venv_py] + sys.argv)
+
 import time
 import re
 import click
