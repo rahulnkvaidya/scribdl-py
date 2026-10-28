@@ -80,6 +80,9 @@ python main.py -f urls.txt -t 3
 - `-p, --pages` : Page selection (`all`, `3`, or `1-10`).
 - `-d, --delay` : Custom extra delay per page in seconds (e.g., `0.5`).
 - `-s, --scale` : Scale factor (`1` for SD, `2` for HD).
+- `-sp, --search-pages` : Number of search result pages to scrape (default: `1`).
+- `--save-urls` : File to save extracted search URLs into (default: `urls.txt`).
+- `--scrape-only` : Only scrape and save URLs without downloading.
 - `-b, --browser-path` : Path to custom Chromium/Chrome executable (supports `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`).
 - `-q, --quiet` : Disable progress output (silent mode).
 
@@ -91,6 +94,12 @@ python main.py "https://www.scribd.com/document/123456789/Sample-Document" --pag
 
 # Parallel batch download from file with 4 threads
 python main.py -f urls.txt -t 4
+
+# Search page: automatically scrape all results to urls.txt and download
+python main.py "https://www.scribd.com/search?query=Verbal%20Ability%20mcq" -t 3
+
+# Scrape 2 pages of search results to urls.txt without downloading immediately
+python main.py --scrape-only -sp 2 "https://www.scribd.com/search?query=Verbal%20Ability%20mcq"
 ```
 
 ---

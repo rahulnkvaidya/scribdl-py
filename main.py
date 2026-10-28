@@ -132,6 +132,66 @@ def log_history(url, title, pages_count, output_file):
     with open(history_file, 'w') as f:
         json.dump(history, f, indent=4)
 
+def is_scribd_search_url(url):
+    return bool(re.search(r"scribd\.com/search\b", url, re.I))
+
+def extract_search_urls(search_url, browser_path=None, max_pages=1, save_to="urls.txt", quiet=False):
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+    all_urls = []
+    seen = set()
+    
+    parsed = urlparse(search_url)
+    qs = parse_qs(parsed.query)
+    
+    with sync_playwright() as p:
+        browser = launch_browser(p, headless=True, custom_executable_path=browser_path)
+        context = browser.new_context(viewport={"width": 1280, "height": 800})
+        page = context.new_page()
+        
+        for page_num in range(1, max_pages + 1):
+            current_qs = qs.copy()
+            current_qs["page"] = [str(page_num)]
+            new_query = urlencode(current_qs, doseq=True)
+            current_url = urlunparse(parsed._replace(query=new_query))
+            
+            if not quiet:
+                print(f"Scraping search results (page {page_num}/{max_pages})...")
+            try:
+                page.goto(current_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3000)
+            except Exception as e:
+                if not quiet:
+                    print(f"Warning: Failed to load search page {page_num}: {e}")
+                break
+                
+            for _ in range(2):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1000)
+                
+            links = page.eval_on_selector_all("a[href*=\"/document/\"]", "elements => elements.map(e => e.href)")
+            new_count = 0
+            for link in links:
+                clean = link.split("?")[0].split("#")[0]
+                if re.search(r"/document/\d+", clean) and clean not in seen:
+                    seen.add(clean)
+                    all_urls.append(clean)
+                    new_count += 1
+            if not quiet:
+                print(f"  Found {new_count} document(s) on page {page_num}. (Total unique: {len(all_urls)})")
+            if new_count == 0:
+                break
+                
+        browser.close()
+        
+    if save_to and all_urls:
+        with open(save_to, "w", encoding="utf-8") as f:
+            for u in all_urls:
+                f.write(u + "\n")
+        if not quiet:
+            print(f"[✓] Saved {len(all_urls)} URL(s) to '{save_to}'")
+            
+    return all_urls
+
 def process_download(url, output, pages, delay, scale, quiet, is_batch=False, threads=1, browser_path=None):
     config_settings = load_config()
     final_delay = delay if delay is not None else config_settings['delay']
@@ -321,9 +381,12 @@ def process_download(url, output, pages, delay, scale, quiet, is_batch=False, th
 @click.option('--pages', '-p', help='Page range (e.g. "all", "3", or "1-10")')
 @click.option('--delay', '-d', type=float, help='Extra delay between page scrolls (seconds)')
 @click.option('--scale', '-s', type=int, help='Scaling factor (1 or 2)')
+@click.option('--search-pages', '-sp', type=int, default=1, help='Number of search result pages to scrape (default: 1)')
+@click.option('--save-urls', help='File to save scraped search URLs into (default: urls.txt)')
+@click.option('--scrape-only', is_flag=True, help='Only scrape search results to file without downloading')
 @click.option('--browser-path', '-b', help='Path to custom Chromium/Chrome executable')
 @click.option('--quiet', '-q', is_flag=True, help='Disable progress output')
-def main(url, file, threads, output, pages, delay, scale, browser_path, quiet):
+def main(url, file, threads, output, pages, delay, scale, search_pages, save_urls, scrape_only, browser_path, quiet):
     config_settings = load_config()
     final_threads = threads if threads is not None else 3
     urls_to_process = []
@@ -341,7 +404,21 @@ def main(url, file, threads, output, pages, delay, scale, browser_path, quiet):
             print(f"Batch mode: Found {len(urls_to_process)} URL(s) to process (using up to {final_threads} parallel threads).")
     elif url:
         clean_input = url.strip().strip("'\"")
-        if clean_input.endswith('.txt') and os.path.exists(clean_input):
+        if is_scribd_search_url(clean_input):
+            save_file = save_urls if save_urls else "urls.txt"
+            if not quiet:
+                print(f"Detected Scribd search URL. Extracting document links...")
+            scraped_urls = extract_search_urls(clean_input, browser_path=browser_path, max_pages=search_pages, save_to=save_file, quiet=quiet)
+            if not scraped_urls:
+                print("Error: No documents found on the search page.")
+                sys.exit(1)
+            if scrape_only:
+                if not quiet:
+                    print(f"Scrape-only mode enabled. URLs saved to '{save_file}'. Exiting.")
+                sys.exit(0)
+            urls_to_process = scraped_urls
+            file = save_file
+        elif clean_input.endswith('.txt') and os.path.exists(clean_input):
             file = clean_input
             with open(file, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -360,9 +437,31 @@ def main(url, file, threads, output, pages, delay, scale, browser_path, quiet):
             print("Select mode:")
             print("  1. Single URL")
             print("  2. Batch file (.txt)")
+            print("  3. Search URL (Scrape & Download all)")
             choice = input("Enter choice [1]: ").strip().strip("'\"")
             
-            if choice == "2":
+            if choice == "3" or is_scribd_search_url(choice):
+                search_input = choice if is_scribd_search_url(choice) else input("Enter Scribd search URL: ").strip().strip("'\"")
+                if not search_input:
+                    print("Error: Search URL cannot be empty.")
+                    sys.exit(1)
+                num_pages_input = input("Enter number of search pages to scrape [1]: ").strip()
+                max_p = int(num_pages_input) if num_pages_input.isdigit() and int(num_pages_input) > 0 else 1
+                save_file = save_urls if save_urls else "urls.txt"
+                scraped_urls = extract_search_urls(search_input, browser_path=browser_path, max_pages=max_p, save_to=save_file, quiet=quiet)
+                if not scraped_urls:
+                    print("Error: No documents found on the search page.")
+                    sys.exit(1)
+                if scrape_only:
+                    if not quiet:
+                        print(f"Scrape-only mode enabled. URLs saved to '{save_file}'. Exiting.")
+                    sys.exit(0)
+                urls_to_process = scraped_urls
+                file = save_file
+                threads_input = input(f"Enter max parallel threads [{final_threads}]: ").strip()
+                if threads_input.isdigit() and int(threads_input) > 0:
+                    final_threads = int(threads_input)
+            elif choice == "2":
                 file_path = input("Enter batch file path (e.g. urls.txt): ").strip().strip("'\"")
                 if not os.path.exists(file_path):
                     print(f"Error: File '{file_path}' not found.")
@@ -382,7 +481,18 @@ def main(url, file, threads, output, pages, delay, scale, browser_path, quiet):
                 if not quiet:
                     print(f"Batch mode: Found {len(urls_to_process)} URL(s) to process (using up to {final_threads} parallel threads).")
             elif choice.startswith("http://") or choice.startswith("https://") or (choice.isdigit() and len(choice) > 4):
-                urls_to_process.append(choice)
+                if is_scribd_search_url(choice):
+                    save_file = save_urls if save_urls else "urls.txt"
+                    scraped_urls = extract_search_urls(choice, browser_path=browser_path, max_pages=search_pages, save_to=save_file, quiet=quiet)
+                    if not scraped_urls:
+                        print("Error: No documents found on the search page.")
+                        sys.exit(1)
+                    if scrape_only:
+                        sys.exit(0)
+                    urls_to_process = scraped_urls
+                    file = save_file
+                else:
+                    urls_to_process.append(choice)
             elif choice.endswith(".txt") and os.path.exists(choice):
                 file = choice
                 with open(choice, 'r', encoding='utf-8') as f:
@@ -398,7 +508,17 @@ def main(url, file, threads, output, pages, delay, scale, browser_path, quiet):
             else:
                 input_url = input("Enter target URL: ").strip().strip("'\"")
                 if input_url:
-                    if input_url.endswith('.txt') and os.path.exists(input_url):
+                    if is_scribd_search_url(input_url):
+                        save_file = save_urls if save_urls else "urls.txt"
+                        scraped_urls = extract_search_urls(input_url, browser_path=browser_path, max_pages=search_pages, save_to=save_file, quiet=quiet)
+                        if not scraped_urls:
+                            print("Error: No documents found on the search page.")
+                            sys.exit(1)
+                        if scrape_only:
+                            sys.exit(0)
+                        urls_to_process = scraped_urls
+                        file = save_file
+                    elif input_url.endswith('.txt') and os.path.exists(input_url):
                         file = input_url
                         with open(file, 'r', encoding='utf-8') as f:
                             for line in f:
