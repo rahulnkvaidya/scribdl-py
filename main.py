@@ -280,9 +280,9 @@ def process_download(url, output, pages, delay, scale, quiet, is_batch=False, th
 
     embed_url = f"https://www.scribd.com/embeds/{doc_id}/content?start_page=1&view_mode=scroll"
     
-    temp_dir_obj = tempfile.TemporaryDirectory(prefix="scribdl_")
-    temp_dir = temp_dir_obj.name
-    atexit.register(temp_dir_obj.cleanup)
+    # Persistent temp folder per document to support resuming interrupted downloads
+    temp_dir = os.path.join(tempfile.gettempdir(), f"scribdl_cache_{doc_id}")
+    os.makedirs(temp_dir, exist_ok=True)
 
     with sync_playwright() as p:
         if not quiet:
@@ -367,6 +367,21 @@ def process_download(url, output, pages, delay, scale, quiet, is_batch=False, th
         bar_length = 20
         spinner_chars = ['|', '/', '-', '\\']
         for idx_count, idx in enumerate(page_indices, start=1):
+            img_path = os.path.join(temp_dir, f"page_{idx+1}.png")
+            # Resume check: if page image was already captured previously, reuse it
+            if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+                image_paths.append(img_path)
+                if not quiet:
+                    percent = int((idx_count / total_selected) * 100)
+                    filled = int(bar_length * (idx_count / total_selected))
+                    bar = '#' * filled + '.' * (bar_length - filled)
+                    if is_batch:
+                        print(f"[{doc_title[:25]}] Page {idx_count}/{total_selected} ({percent}%) [Cached]")
+                    else:
+                        sys.stdout.write(f"\r[Cached] Page {idx_count}/{total_selected} [{bar}] {percent}%")
+                        sys.stdout.flush()
+                continue
+
             page_element = all_locators.nth(idx)
             page_element.scroll_into_view_if_needed()
             
@@ -390,7 +405,6 @@ def process_download(url, output, pages, delay, scale, quiet, is_batch=False, th
             if final_delay > 0:
                 time.sleep(final_delay)
                 
-            img_path = os.path.join(temp_dir, f"page_{idx+1}.png")
             page_element.screenshot(path=img_path)
             image_paths.append(img_path)
 
@@ -430,9 +444,10 @@ def process_download(url, output, pages, delay, scale, quiet, is_batch=False, th
         browser.close()
         log_history(url, doc_title, len(page_indices), output_file)
             
+    # Clean up cached page images only after successful PDF generation
+    import shutil
     try:
-        temp_dir_obj.cleanup()
-        atexit.unregister(temp_dir_obj.cleanup)
+        shutil.rmtree(temp_dir, ignore_errors=True)
     except Exception:
         pass
     
